@@ -1,54 +1,75 @@
 import discord
-from discord.ext import commands, tasks
-import datetime
-import requests
-import feedparser
+from discord.ext import commands
 import os
+import json
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import datetime
 
-# --- 設定（Renderの環境変数から取得） ---
+# --- 設定 ---
 TOKEN = os.getenv('DISCORD_TOKEN')
-NEWS_CH_ID = int(os.getenv('NEWS_CH_ID', 0))
-WEATHER_CH_ID = int(os.getenv('WEATHER_CH_ID', 0))
-GREETING_CH_ID = int(os.getenv('GREETING_CH_ID', 0))
+# Renderの環境変数にJSONの中身をそのまま貼り付けてください
+GCP_JSON = os.getenv('GCP_SERVICE_ACCOUNT') 
+SPREADSHEET_KEY = os.getenv('SPREADSHEET_KEY') # スプレッドシートのURLにあるID
 
-JST = datetime.timezone(datetime.timedelta(hours=9))
-NOTIFY_TIME = datetime.time(hour=7, minute=0, tzinfo=JST)
+# Googleスプレッドシートへの認証
+def get_gspread_client():
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds_dict = json.loads(GCP_JSON)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    return gspread.authorize(creds)
 
 class MyBot(commands.Bot):
     def __init__(self):
-        intents = discord.Intents.default()
-        intents.members = True
-        intents.message_content = True
+        intents = discord.Intents.all()
         super().__init__(command_prefix="!", intents=intents)
 
-    async def setup_hook(self):
-        self.morning_task.start()
+# --- 執筆管理：スプレッドシート連携コマンド ---
 
-    async def on_ready(self):
-        print(f'Logged in as {self.user.name}')
+@bot.command()
+async def write(ctx, title: str, count: int):
+    """執筆報告: !write 作品名 文字数"""
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_key(SPREADSHEET_KEY).sheet1 # 最初のシート
+        
+        # 記録用データの作成
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+        date_str = now.strftime("%Y/%m/%d %H:%M")
+        user_name = ctx.author.name
+        
+        # シートの末尾に行を追加 [日付, ユーザー, 作品名, 文字数]
+        sheet.append_row([date_str, user_name, title, count])
+        
+        # 応援メッセージの抽選
+        cheers = ["その調子です！", "素晴らしい進捗ですね！", "執筆お疲れ様です！", "一歩前進ですね！"]
+        
+        embed = discord.Embed(title="📝 執筆を記録しました", color=0x2ecc71)
+        embed.add_field(name="作品名", value=title, inline=True)
+        embed.add_field(name="今回報告", value=f"{count} 字", inline=True)
+        embed.set_footer(text=random.choice(cheers))
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"⚠️ 記録に失敗しました: {e}")
 
-    # --- 朝の通知タスク (各チャンネルへ振り分け) ---
-    @tasks.loop(time=NOTIFY_TIME)
-    async def morning_task(self):
-        # 1. 朝の挨拶
-        greeting_ch = self.get_channel(GREETING_CH_ID)
-        if greeting_ch:
-            today = datetime.date.today().strftime("%Y/%m/%d")
-            await greeting_ch.send(f"☀️ **{today} おはようございます！**\n今日も一日、楽しく過ごしましょう！")
+@bot.command()
+async def stats(ctx):
+    """これまでの合計執筆文字数を集計"""
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_key(SPREADSHEET_KEY).sheet1
+        records = sheet.get_all_records()
+        
+        total = sum(int(row['文字数']) for row in records if row['ユーザー'] == ctx.author.name)
+        
+        embed = discord.Embed(title=f"📊 {ctx.author.name}さんの統計", color=0x9b59b6)
+        embed.add_field(name="累計執筆文字数", value=f"{total} 字", inline=False)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"⚠️ 集計に失敗しました: {e}")
 
-        # 2. 天気予報
-        weather_ch = self.get_channel(WEATHER_CH_ID)
-        if weather_ch:
-            try:
-                w_url = "https://api.open-meteo.com/v1/forecast?latitude=35.6895&longitude=139.6917&daily=temperature_2m_max,temperature_2m_min&timezone=Asia%2FTokyo"
-                w_res = requests.get(w_url).json()
-                max_t = w_res['daily']['temperature_2m_max'][0]
-                min_t = w_res['daily']['temperature_2m_min'][0]
-                
-                embed_w = discord.Embed(title="🌡️ 今日の天気 (東京)", color=0x00aaff)
-                embed_w.add_field(name="最高気温", value=f"{max_t}℃", inline=True)
-                embed_w.add_field(name="最低気温", value=f"{min_t}℃", inline=True)
-                await weather_ch.send(embed=embed_w)
+# (以前の朝の通知やチケット機能のコードと組み合わせて使用してください)
             except:
                 await weather_ch.send("⚠️ 天気情報の取得に失敗しました。")
 
@@ -74,3 +95,64 @@ async def ping(ctx):
 
 if TOKEN:
     bot.run(TOKEN)
+# --- 作品登録機能 ---
+@bot.command()
+async def entry(ctx, title: str, theme: str, goal: int, deadline: str):
+    """作品の基本情報を登録: !entry タイトル テーマ 目標字数 2024/12/31"""
+    try:
+        client = get_gspread_client()
+        sheet = client.open_by_key(SPREADSHEET_KEY).worksheet("Works")
+        
+        # データの追加
+        sheet.append_row([title, theme, goal, deadline, "執筆中"])
+        
+        embed = discord.Embed(title="📔 新規作品を登録しました", color=0x3498db)
+        embed.add_field(name="タイトル", value=title, inline=True)
+        embed.add_field(name="テーマ", value=theme, inline=True)
+        embed.add_field(name="目標文字数", value=f"{goal} 字", inline=True)
+        embed.add_field(name="締切", value=deadline, inline=True)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"⚠️ 登録に失敗しました。シート名「Works」があるか確認してください: {e}")
+
+# --- 進捗・ペース分析機能 ---
+@bot.command()
+async def check(ctx, title: str):
+    """作品の進捗と必要ペースを分析: !check タイトル"""
+    try:
+        client = get_gspread_client()
+        # 作品情報の取得
+        works_sheet = client.open_by_key(SPREADSHEET_KEY).worksheet("Works")
+        work = next((r for r in works_sheet.get_all_records() if r['作品名'] == title), None)
+        
+        # 執筆履歴の取得
+        log_sheet = client.open_by_key(SPREADSHEET_KEY).sheet1
+        current_total = sum(int(r['文字数']) for r in log_sheet.get_all_records() if r['作品名'] == title)
+        
+        if not work:
+            return await ctx.send("作品が見つかりません。先に !entry で登録してください。")
+
+        goal = int(work['目標字数'])
+        deadline = datetime.datetime.strptime(work['締切日'], "%Y/%m/%d").date()
+        days_left = (deadline - datetime.date.today()).days
+        
+        # 進捗計算
+        percent = (current_total / goal) * 100
+        bar_num = int(percent // 10)
+        bar = "🟦" * bar_num + "⬜" * (10 - bar_num)
+        
+        # 必要ペース計算
+        remaining_chars = goal - current_total
+        pace = remaining_chars / days_left if days_left > 0 else remaining_chars
+
+        embed = discord.Embed(title=f"📊 進捗レポート: {title}", color=0xf1c40f)
+        embed.add_field(name="現在の進捗", value=f"{bar} {percent:.1f}%", inline=False)
+        embed.add_field(name="書いた文字数", value=f"{current_total} / {goal} 字", inline=True)
+        embed.add_field(name="残り日数", value=f"{max(0, days_left)} 日", inline=True)
+        
+        if days_left > 0 and remaining_chars > 0:
+            embed.add_field(name="📈 完遂に必要なペース", value=f"1日あたり **{int(pace)}** 字", inline=False)
+        
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"⚠️ 分析に失敗しました: {e}")
